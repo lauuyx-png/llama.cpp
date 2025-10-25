@@ -1771,6 +1771,9 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context& ctx,
                     return false;
             }
             break;
+        case GGML_OP_OUT_PROD:
+            ggml_cann_out_prod(ctx, dst);
+            return true;
         case GGML_OP_NORM:
             ggml_cann_norm(ctx, dst);
             break;
@@ -2403,6 +2406,12 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev,
                     return false;
             }
         }
+
+        // ===== OUT_PROD =====
+        case GGML_OP_OUT_PROD: {
+            return true;
+        }
+
         case GGML_OP_ROPE: {
             // TODO: with ops-test v == 1
             float ext_factor = 0.0f;

@@ -79,6 +79,8 @@
 
 #include "ggml-impl.h"
 #include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
 
 #define GGML_COMMON_DECL_C
 
@@ -422,6 +424,165 @@ void ggml_cann_argsort(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
     GGML_CANN_CALL_ACLNN_OP(ctx, Cast, tmp_tensor, ggml_cann_type_mapping(dst->type), acl_dst);
     ggml_cann_release_resources(ctx, acl_src, tmp_tensor, acl_dst);
 }
+
+// ================= F32 × F32 =================
+static inline void ggml_cann_out_prod_f32_impl(
+    ggml_backend_cann_context & ctx,
+    ggml_tensor * a_f32,      // src0 (F32)
+    ggml_tensor * b_f32,      // src1 (F32)
+    ggml_tensor * dst_f32) {  // dst  (F32)
+
+    GGML_ASSERT(a_f32  && b_f32 && dst_f32);
+    GGML_ASSERT(a_f32->type  == GGML_TYPE_F32);
+    GGML_ASSERT(b_f32->type  == GGML_TYPE_F32);
+    GGML_ASSERT(dst_f32->type == GGML_TYPE_F32);
+
+    // I, J, K
+    const int64_t I  = a_f32->ne[0];
+    const int64_t KA = a_f32->ne[1];
+    const int64_t J  = b_f32->ne[0];
+    const int64_t KB = b_f32->ne[1];
+
+    GGML_ASSERT(dst_f32->ne[0] == I);
+    GGML_ASSERT(dst_f32->ne[1] == J);
+
+    // CPU 端约束：B 与 C 的批维一致；A 的批维可被 C 整数倍复制
+    GGML_ASSERT(dst_f32->ne[2] == b_f32->ne[2]);
+    GGML_ASSERT(dst_f32->ne[3] == b_f32->ne[3]);
+    GGML_ASSERT(dst_f32->ne[2] % std::max<int64_t>(a_f32->ne[2], 1) == 0);
+    GGML_ASSERT(dst_f32->ne[3] % std::max<int64_t>(a_f32->ne[3], 1) == 0);
+
+    // K 维：允许 A 或 B 为 1（标量）来广播
+    const int64_t K = std::max(KA, KB);
+    GGML_ASSERT(KA == 1 || KB == 1 || KA == KB);
+
+    // 分组复制系数（与 CPU 实现一致）
+    const int64_t C_ne2 = dst_f32->ne[2], C_ne3 = dst_f32->ne[3];
+    const int64_t A_ne2 = std::max<int64_t>(a_f32->ne[2], 1);
+    const int64_t A_ne3 = std::max<int64_t>(a_f32->ne[3], 1);
+    const int64_t B_ne2 = b_f32->ne[2], B_ne3 = b_f32->ne[3];
+
+    GGML_ASSERT(C_ne2 % A_ne2 == 0);
+    GGML_ASSERT(C_ne3 % A_ne3 == 0);
+    const int64_t dps2 = C_ne2 / A_ne2;  // 每个 A.i2 复制 dps2 次到 C
+    const int64_t dps3 = C_ne3 / A_ne3;  // 每个 A.i3 复制 dps3 次到 C
+
+    // 原始 stride（字节）
+    const size_t A_nbM    = (size_t)a_f32->nb[0];
+    const size_t A_nbKraw = (size_t)a_f32->nb[1];
+    const size_t A_nb2    = (size_t)a_f32->nb[2];
+    const size_t A_nb3    = (size_t)a_f32->nb[3];
+
+    const size_t B_nbN    = (size_t)b_f32->nb[0];
+    const size_t B_nbKraw = (size_t)b_f32->nb[1];
+    const size_t B_nb2    = (size_t)b_f32->nb[2];
+    const size_t B_nb3    = (size_t)b_f32->nb[3];
+
+    const size_t C_nbM    = (size_t)dst_f32->nb[0];
+    const size_t C_nbN    = (size_t)dst_f32->nb[1];
+    const size_t C_nb2    = (size_t)dst_f32->nb[2];
+    const size_t C_nb3    = (size_t)dst_f32->nb[3];
+
+    // K 维广播（步长置 0 即可）
+    const size_t A_nbK = (KA == 1 && K > 1) ? 0 : A_nbKraw;
+    const size_t B_nbK = (KB == 1 && K > 1) ? 0 : B_nbKraw;
+
+    // 工具：构造 3D ND tensor [1, D1, D2]，把“batch 维”对 CANN 说成 1（nbB=0）
+    auto make_acl3 = [&](ggml_tensor * t,
+                     size_t byte_offset,
+                     int64_t M, int64_t N,
+                     size_t nbM, size_t nbN) -> aclTensor * {
+        int64_t ne_in[3] = { N, M, 1 };   // 预反转
+        size_t  nb_in[3] = { nbN, nbM, 0 }; // batch 维步长 0 → 单批
+        return ggml_cann_create_tensor(t, ne_in, nb_in, /*dims=*/3, ACL_FORMAT_ND, byte_offset);
+    };
+
+    // 遍历 C 的每个批块，按 CPU 规则计算 A/B 的对应批块
+    for (int64_t c_i3 = 0; c_i3 < C_ne3; ++c_i3) {
+        for (int64_t c_i2 = 0; c_i2 < C_ne2; ++c_i2) {
+            // C 的批索引
+            const size_t c_off = (size_t)c_i2 * C_nb2 + (size_t)c_i3 * C_nb3;
+
+            // A 的批索引（分组复制：用“整除”）
+            const int64_t a_i2 = (A_ne2 == 1) ? 0 : (c_i2 / dps2);
+            const int64_t a_i3 = (A_ne3 == 1) ? 0 : (c_i3 / dps3);
+            const size_t  a_off = (size_t)a_i2 * A_nb2 + (size_t)a_i3 * A_nb3;
+
+            // B 的批索引（与 C 一致，无分组）
+            const int64_t b_i2 = (B_ne2 == 0) ? 0 : c_i2;
+            const int64_t b_i3 = (B_ne3 == 0) ? 0 : c_i3;
+            const size_t  b_off = (size_t)b_i2 * B_nb2 + (size_t)b_i3 * B_nb3;
+
+            // A: [I, K]  →  make_acl3(M=I, N=K, nbM=A_nb0, nbN=A_nb1)
+            aclTensor * acl_a = make_acl3(a_f32,  a_off, /*M*/ I, /*N*/ K,
+                                        /*nbM*/ A_nbM, /*nbN*/ A_nbK);
+
+            // B: [K, J]  →  make_acl3(M=K, N=J, nbM=B_nb1, nbN=B_nb0)
+            aclTensor * acl_b = make_acl3(b_f32,  b_off, /*M*/ K, /*N*/ J,
+                                        /*nbM*/ B_nbK, /*nbN*/ B_nbN);
+
+            // C: [I, J]  →  make_acl3(M=I, N=J, nbM=C_nb0, nbN=C_nb1)
+            aclTensor * acl_c = make_acl3(dst_f32, c_off, /*M*/ I, /*N*/ J,
+                                        /*nbM*/ C_nbM, /*nbN*/ C_nbN);
+
+            const int8_t transpose_x1 = 0;
+            GGML_CANN_CALL_ACLNN_OP(
+                ctx, BatchMatMul,
+                /*x1=*/acl_a,
+                /*x2=*/acl_b,
+                /*out=*/acl_c,
+                /*transpose_x1=*/transpose_x1
+            );
+
+            ggml_cann_release_resources(ctx, acl_a, acl_b, acl_c);
+        }
+    }
+}
+
+// ================ 算子入口 ==================== 
+void ggml_cann_out_prod(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+    ggml_tensor * A = dst->src[0];
+    ggml_tensor * B = dst->src[1];
+    
+    switch (A->type) {
+    // ---- 量化 A + F32 B ----
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_IQ2_XXS:{
+            if(B->type == GGML_TYPE_F32){
+                // TODO
+                // ggml_cann_out_prod_q_f32_impl(ctx, A, B, dst);
+            }
+            break;
+        }
+        case GGML_TYPE_F32:{
+            if(B->type == GGML_TYPE_F32){// F32,F32
+                ggml_cann_out_prod_f32_impl(ctx, A, B, dst);
+            }
+            else if(B->type == GGML_TYPE_F16){// F32,F16
+                // TODO
+                // ggml_cann_out_prod_f32_f16_impl(ctx, A, B, dst);
+            }
+            break;
+        }
+        // {{F16,F32}/{F16,F16}
+        case GGML_TYPE_F16:{
+            if(B->type == GGML_TYPE_F32){// F32,F32
+                // TODO
+                // ggml_cann_out_prod_f16_f32_impl(ctx, A, B, dst);
+            }
+            else if(B->type == GGML_TYPE_F16){// F32,F16
+                // TODO
+                // ggml_cann_out_prod_f16_impl(ctx, A, B, dst);
+            }
+            break;
+        }
+    }
+}
+
 
 void ggml_cann_norm(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
     ggml_tensor* src = dst->src[0];
